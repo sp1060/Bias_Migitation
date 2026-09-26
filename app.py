@@ -23,12 +23,13 @@ api_key_from_secrets = st.secrets.get("GROQ_API_KEY", "")
 groq_api_key = st.sidebar.text_input("Groq API Key (gsk_...)", value=api_key_from_secrets, type="password")
 
 # ==========================================
-# DYNAMIC MODEL FETCH
+# DYNAMIC MODEL FETCH & FILTERING
 # ==========================================
 def get_available_groq_models(api_key: str):
-    """Fetches currently active model IDs directly from Groq API."""
+    """Fetches active text-chat models from Groq API, filtering out TTS/audio/guard models."""
+    fallback_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
     if not api_key:
-        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        return fallback_models
     
     url = "https://api.groq.com/openai/v1/models"
     headers = {
@@ -40,10 +41,16 @@ def get_available_groq_models(api_key: str):
         req = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=5.0) as response:
             res_body = json.loads(response.read().decode("utf-8"))
-            models = [m["id"] for m in res_body.get("data", []) if "whisper" not in m["id"] and "guard" not in m["id"]]
-            return models if models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+            models = []
+            for m in res_body.get("data", []):
+                m_id = m["id"]
+                # Filter out non-text/chat completion models
+                excluded_keywords = ["whisper", "guard", "canopylabs", "orpheus", "tts", "stt", "audio", "vision"]
+                if not any(k in m_id.lower() for k in excluded_keywords):
+                    models.append(m_id)
+            return models if models else fallback_models
     except Exception:
-        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        return fallback_models
 
 st.sidebar.header("2. Model Selection")
 available_models = get_available_groq_models(groq_api_key)
@@ -121,7 +128,7 @@ def compute_paper_fairness_metrics(df_res, protected_col, target_col):
     return {'Acc': acc, 'F1': f1, 'SPR': spr, 'EOR': eor, 'EOD': eod, 'PP': pp, 'SAG': sag}
 
 # ==========================================
-# PROMPT BUILDERS & API CALL
+# PROMPT BUILDERS & API ROUTER
 # ==========================================
 def generate_icl_text(train_df, strategy, feature_cols, protected_col, target_col, demo_groups):
     if strategy == "F":
