@@ -14,23 +14,40 @@ from sklearn.metrics import accuracy_score, f1_score
 # ==========================================
 st.set_page_config(page_title="Table 12 COMPAS Replication", layout="wide")
 st.title("🎯 COMPAS Dataset - Table 12 Replication Console")
-st.caption("Powered by Groq API (Llama 3.3 70B Versatile)")
+st.caption("Powered by Groq API")
 
 # Sidebar API authorization
 st.sidebar.header("1. API Authorization")
 
-# Auto-detect key from Streamlit Secrets or fall back to text input
 api_key_from_secrets = st.secrets.get("GROQ_API_KEY", "")
 groq_api_key = st.sidebar.text_input("Groq API Key (gsk_...)", value=api_key_from_secrets, type="password")
 
+# ==========================================
+# DYNAMIC MODEL FETCH
+# ==========================================
+def get_available_groq_models(api_key: str):
+    """Fetches currently active model IDs directly from Groq API."""
+    if not api_key:
+        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    
+    url = "https://api.groq.com/openai/v1/models"
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=5.0) as response:
+            res_body = json.loads(response.read().decode("utf-8"))
+            models = [m["id"] for m in res_body.get("data", []) if "whisper" not in m["id"] and "guard" not in m["id"]]
+            return models if models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    except Exception:
+        return ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+
 st.sidebar.header("2. Model Selection")
-model_options = [
-    "llama-3.3-70b-versatile",
-    "llama-3.1-8b-instant",
-    "qwen-2.5-coder-32b",
-    "mixtral-8x7b-32768"
-]
-active_model = st.sidebar.selectbox("Choose Primary Model", model_options)
+available_models = get_available_groq_models(groq_api_key)
+active_model = st.sidebar.selectbox("Choose Primary Model", available_models)
 
 # ==========================================
 # EXTRACTION & METRICS ENGINE
@@ -104,7 +121,7 @@ def compute_paper_fairness_metrics(df_res, protected_col, target_col):
     return {'Acc': acc, 'F1': f1, 'SPR': spr, 'EOR': eor, 'EOD': eod, 'PP': pp, 'SAG': sag}
 
 # ==========================================
-# PROMPT BUILDERS & API ROUTER
+# PROMPT BUILDERS & API CALL
 # ==========================================
 def generate_icl_text(train_df, strategy, feature_cols, protected_col, target_col, demo_groups):
     if strategy == "F":
