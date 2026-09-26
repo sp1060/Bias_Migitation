@@ -14,7 +14,7 @@ from sklearn.metrics import accuracy_score, f1_score
 # ==========================================
 st.set_page_config(page_title="Table 12 COMPAS Replication", layout="wide")
 st.title("🎯 COMPAS Dataset - Table 12 Replication Console")
-st.caption("Powered by Groq API")
+st.caption("Powered by Groq API (Rate-Limit Optimized)")
 
 # Sidebar API authorization
 st.sidebar.header("1. API Authorization")
@@ -44,7 +44,6 @@ def get_available_groq_models(api_key: str):
             models = []
             for m in res_body.get("data", []):
                 m_id = m["id"]
-                # Filter out non-text/chat completion models
                 excluded_keywords = ["whisper", "guard", "canopylabs", "orpheus", "tts", "stt", "audio", "vision"]
                 if not any(k in m_id.lower() for k in excluded_keywords):
                     models.append(m_id)
@@ -54,7 +53,9 @@ def get_available_groq_models(api_key: str):
 
 st.sidebar.header("2. Model Selection")
 available_models = get_available_groq_models(groq_api_key)
-active_model = st.sidebar.selectbox("Choose Primary Model", available_models)
+# Ensure llama-3.1-8b-instant is selected by default for maximum rate limit capacity
+default_model_idx = available_models.index("llama-3.1-8b-instant") if "llama-3.1-8b-instant" in available_models else 0
+active_model = st.sidebar.selectbox("Choose Primary Model", available_models, index=default_model_idx)
 
 # ==========================================
 # EXTRACTION & METRICS ENGINE
@@ -176,7 +177,7 @@ def construct_full_prompt(strategy, icl_text, test_instance, feature_cols, prote
     few_shot = f"Examples:\n{icl_text}\n\n" if icl_text else ""
     return f"{directive}\n\n{few_shot}Evaluate Sample Data:\n{json.dumps(test_feats)}\n\nRespond ONLY with a JSON object: {{\"prediction\": 1}} or {{\"prediction\": 0}}"
 
-def call_groq_api(api_key: str, model: str, prompt: str):
+def call_groq_api(api_key: str, model: str, prompt: str, max_retries: int = 3):
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key.strip()}",
@@ -194,24 +195,33 @@ def call_groq_api(api_key: str, model: str, prompt: str):
     }
     
     data = json.dumps(payload).encode("utf-8")
-    try:
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=10.0) as response:
-            res_body = json.loads(response.read().decode("utf-8"))
-            if "choices" in res_body and len(res_body["choices"]) > 0:
-                content = res_body["choices"][0]["message"]["content"]
-                pred, parse_msg = extract_binary_prediction(content)
-                if pred is not None:
-                    return pred, content, None
+
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10.0) as response:
+                res_body = json.loads(response.read().decode("utf-8"))
+                time.sleep(1.2)  # Delay between successful calls to stay under RPM limits
+                if "choices" in res_body and len(res_body["choices"]) > 0:
+                    content = res_body["choices"][0]["message"]["content"]
+                    pred, parse_msg = extract_binary_prediction(content)
+                    if pred is not None:
+                        return pred, content, None
+                    else:
+                        return 0, content, f"Parse Error: {parse_msg}"
                 else:
-                    return 0, content, f"Parse Error: {parse_msg}"
-            else:
-                return 0, str(res_body), f"API Error: Missing 'choices' in response"
-    except urllib.error.HTTPError as e:
-        err_msg = e.read().decode("utf-8")
-        return 0, err_msg, f"HTTP Error {e.code}"
-    except Exception as e:
-        return 0, str(e), f"Exception: {str(e)}"
+                    return 0, str(res_body), f"API Error: Missing 'choices' in response"
+        except urllib.error.HTTPError as e:
+            if e.code == 429:  # Rate limit reached
+                wait_time = (attempt + 1) * 4  # Backoff wait: 4s, 8s, 12s
+                time.sleep(wait_time)
+                continue
+            err_msg = e.read().decode("utf-8")
+            return 0, err_msg, f"HTTP Error {e.code}"
+        except Exception as e:
+            return 0, str(e), f"Exception: {str(e)}"
+
+    return 0, "Rate limit exceeded max retries", "HTTP Error 429 (Max Retries)"
 
 # ==========================================
 # UI EXECUTION
@@ -233,7 +243,7 @@ if uploaded_file and groq_api_key:
     with col2:
         protected_col = st.selectbox("Protected Column", available_protected_cols, index=protected_default_idx)
     with col3:
-        sample_size = st.slider("Samples Per Strategy", min_value=10, max_value=50, value=20)
+        sample_size = st.slider("Samples Per Strategy", min_value=5, max_value=30, value=10)
     with col4:
         num_runs = st.slider("Cross Validation Seeds", min_value=1, max_value=3, value=1)
 
@@ -247,6 +257,10 @@ if uploaded_file and groq_api_key:
         strategies = ["F", "U", "E", "C"]
         formatted_rows = []
         errors_log = []
+        
+        progress_bar = st.progress(0)
+        total_steps = len(strategies) * num_runs * sample_size
+        current_step = 0
 
         for strat in strategies:
             run_metrics_list = []
@@ -274,6 +288,9 @@ if uploaded_file and groq_api_key:
                             'Sent Prompt': prompt
                         })
 
+                    current_step += 1
+                    progress_bar.progress(current_step / total_steps)
+
                 eval_df = test_df.copy()
                 eval_df['pred'] = preds
                 metrics = compute_paper_fairness_metrics(eval_df, protected_col, target_col)
@@ -295,11 +312,11 @@ if uploaded_file and groq_api_key:
 
         st.header("4. Error & Diagnostic Catch Log")
         if errors_log:
-            st.error(f"⚠️ Encountered {len(errors_log)} error(s) during execution:")
+            st.warning(f"⚠️ Completed with {len(errors_log)} error(s) out of {total_steps} requests:")
             err_df = pd.DataFrame(errors_log)
             st.dataframe(err_df, use_container_width=True)
         else:
-            st.success("🎉 No errors detected! All responses were parsed successfully.")
+            st.success("🎉 All responses processed cleanly without hitting rate limits!")
 
 elif not groq_api_key:
     st.warning("Please enter your Groq API Key (gsk_...) in the sidebar to run the replication.")
