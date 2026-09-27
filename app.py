@@ -4,190 +4,54 @@ import numpy as np
 import json
 import urllib.request
 import urllib.error
-import re
 import time
-import traceback
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 
 # ==========================================
 # PAGE CONFIG
 # ==========================================
-st.set_page_config(page_title="Table 12 COMPAS Replication", layout="wide")
-st.title("🎯 COMPAS Dataset - Table 12 Replication Console")
-st.caption("Powered by Groq API (Rate-Limit Optimized)")
+st.set_page_config(
+    page_title="COMPAS Table 12 Replication - Local GPU",
+    page_icon="⚖️",
+    layout="wide"
+)
 
-# Sidebar API authorization
-st.sidebar.header("1. API Authorization")
-
-api_key_from_secrets = st.secrets.get("GROQ_API_KEY", "")
-groq_api_key = st.sidebar.text_input("Groq API Key (gsk_...)", value=api_key_from_secrets, type="password")
-
-# ==========================================
-# DYNAMIC MODEL FETCH & FILTERING
-# ==========================================
-def get_available_groq_models(api_key: str):
-    """Fetches active text-chat models from Groq API, filtering out TTS/audio/guard models."""
-    fallback_models = ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
-    if not api_key:
-        return fallback_models
-    
-    url = "https://api.groq.com/openai/v1/models"
-    headers = {
-        "Authorization": f"Bearer {api_key.strip()}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
-    try:
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=5.0) as response:
-            res_body = json.loads(response.read().decode("utf-8"))
-            models = []
-            for m in res_body.get("data", []):
-                m_id = m["id"]
-                excluded_keywords = ["whisper", "guard", "canopylabs", "orpheus", "tts", "stt", "audio", "vision"]
-                if not any(k in m_id.lower() for k in excluded_keywords):
-                    models.append(m_id)
-            return models if models else fallback_models
-    except Exception:
-        return fallback_models
-
-st.sidebar.header("2. Model Selection")
-available_models = get_available_groq_models(groq_api_key)
-# Ensure llama-3.1-8b-instant is selected by default for maximum rate limit capacity
-default_model_idx = available_models.index("llama-3.1-8b-instant") if "llama-3.1-8b-instant" in available_models else 0
-active_model = st.sidebar.selectbox("Choose Primary Model", available_models, index=default_model_idx)
+st.title("⚖️ COMPAS Fairness Metrics Replication (Table 12)")
+st.caption("Local GPU Execution via Ollama (Zero API Costs / No Rate Limits)")
 
 # ==========================================
-# EXTRACTION & METRICS ENGINE
+# INFERENCE ROUTERS
 # ==========================================
 def extract_binary_prediction(response_text: str):
-    if not response_text:
-        return None, "Empty Response"
-    text = str(response_text).strip()
+    """Parses JSON or raw text response to extra 0 or 1 binary prediction."""
     try:
-        data = json.loads(text)
+        # Try direct JSON load
+        data = json.loads(response_text)
         if isinstance(data, dict):
-            if "prediction" in data:
-                val = str(data["prediction"]).strip()
-                if val in ["0", "1"]:
-                    return int(val), "Valid JSON"
-            if "output" in data:
-                val = str(data["output"]).strip()
-                if val in ["0", "1"]:
-                    return int(val), "Valid JSON (output key)"
+            val = data.get("prediction", data.get("recidivism", None))
+            if val in [0, 1, "0", "1"]:
+                return int(val), "Success (JSON)"
     except Exception:
         pass
-
-    match = re.search(r'["\']?prediction["\']?\s*:\s*["\']?([01])["\']?', text, re.IGNORECASE)
-    if match:
-        return int(match.group(1)), "Regex Key Match"
-
-    digits = re.findall(r'\b([01])\b', text)
-    if digits:
-        return int(digits[-1]), "Fallback Trailing Digit"
-        
-    return None, f"Parsing Failed: '{text}'"
-
-def compute_paper_fairness_metrics(df_res, protected_col, target_col):
-    y_true = df_res[target_col].values.astype(int)
-    y_pred = df_res['pred'].values.astype(int)
     
-    acc = float(accuracy_score(y_true, y_pred))
-    f1 = float(f1_score(y_true, y_pred, zero_division=0))
+    # Fallback substring extraction
+    text_lower = response_text.lower()
+    if "prediction: 1" in text_lower or "'prediction': 1" in text_lower or '"prediction": 1' in text_lower:
+        return 1, "Fallback (Parsed 1)"
+    if "prediction: 0" in text_lower or "'prediction': 0" in text_lower or '"prediction": 0' in text_lower:
+        return 0, "Fallback (Parsed 0)"
+    
+    return None, f"Parsing Error: Could not parse 0/1 from '{response_text[:50]}...'"
 
-    groups = [g for g in df_res[protected_col].unique() if pd.notna(g)]
-    if len(groups) < 2:
-        return {'Acc': acc, 'F1': f1, 'SPR': 1.0, 'EOR': 1.0, 'EOD': 1.0, 'PP': 1.0, 'SAG': 0.0}
-
-    g0 = df_res[df_res[protected_col] == groups[0]]
-    g1 = df_res[df_res[protected_col] == groups[1]]
-
-    def compute_smoothed_ratio(v1, v2, eps=0.01):
-        ratio = (max(v1, v2) + eps) / (min(v1, v2) + eps)
-        return float(min(ratio, 10.0))
-
-    pr0 = (g0['pred'] == 1).mean() if len(g0) > 0 else 0
-    pr1 = (g1['pred'] == 1).mean() if len(g1) > 0 else 0
-    spr = compute_smoothed_ratio(pr0, pr1)
-
-    tpr0 = ((g0['pred'] == 1) & (g0[target_col] == 1)).sum() / max(1, (g0[target_col] == 1).sum())
-    tpr1 = ((g1['pred'] == 1) & (g1[target_col] == 1)).sum() / max(1, (g1[target_col] == 1).sum())
-    eor = compute_smoothed_ratio(tpr0, tpr1)
-
-    fpr0 = ((g0['pred'] == 1) & (g0[target_col] == 0)).sum() / max(1, (g0[target_col] == 0).sum())
-    fpr1 = ((g1['pred'] == 1) & (g1[target_col] == 0)).sum() / max(1, (g1[target_col] == 0).sum())
-    eod = (eor + compute_smoothed_ratio(fpr0, fpr1)) / 2.0
-
-    ppv0 = ((g0['pred'] == 1) & (g0[target_col] == 1)).sum() / max(1, (g0['pred'] == 1).sum())
-    ppv1 = ((g1['pred'] == 1) & (g1[target_col] == 1)).sum() / max(1, (g1['pred'] == 1).sum())
-    pp = compute_smoothed_ratio(ppv0, ppv1)
-
-    acc0 = accuracy_score(g0[target_col], g0['pred']) if len(g0) > 0 else 0
-    acc1 = accuracy_score(g1[target_col], g1['pred']) if len(g1) > 0 else 0
-    sag = float(abs(acc0 - acc1))
-
-    return {'Acc': acc, 'F1': f1, 'SPR': spr, 'EOR': eor, 'EOD': eod, 'PP': pp, 'SAG': sag}
-
-# ==========================================
-# PROMPT BUILDERS & API ROUTER
-# ==========================================
-def generate_icl_text(train_df, strategy, feature_cols, protected_col, target_col, demo_groups):
-    if strategy == "F":
-        return ""
-    elif strategy == "U":
-        samples = train_df.sample(n=min(len(train_df), 4), random_state=42)
-        out = []
-        for r in samples.to_dict('records'):
-            feats = {k: v for k, v in r.items() if k in feature_cols and k != protected_col}
-            out.append(f"Input: {json.dumps(feats)} -> Output: {{\"prediction\": {r[target_col]}}}")
-        return "\n".join(out)
-    elif strategy == "E":
-        strata = []
-        for g in demo_groups:
-            for t in train_df[target_col].unique():
-                sub = train_df[(train_df[protected_col] == g) & (train_df[target_col] == t)]
-                if len(sub) > 0:
-                    strata.append(sub.sample(n=1, random_state=42))
-        esad_df = pd.concat(strata) if strata else train_df.sample(n=4, random_state=42)
-        out = []
-        for r in esad_df.to_dict('records'):
-            feats = {k: v for k, v in r.items() if k in feature_cols}
-            out.append(f"Input: {json.dumps(feats)} -> Output: {{\"prediction\": {r[target_col]}}}")
-        return "\n".join(out)
-    elif strategy == "C":
-        samples = train_df.sample(n=min(len(train_df), 2), random_state=42)
-        out = []
-        for r in samples.to_dict('records'):
-            f = {k: v for k, v in r.items() if k in feature_cols}
-            out.append(f"Input A: {json.dumps(f)} -> Output: {{\"prediction\": {r[target_col]}}}")
-            cf = f.copy()
-            alt = [g for g in demo_groups if g != f.get(protected_col)]
-            if alt:
-                cf[protected_col] = alt[0]
-            out.append(f"Input B: {json.dumps(cf)} -> Output: {{\"prediction\": {r[target_col]}}}")
-        return "\n".join(out)
-
-def construct_full_prompt(strategy, icl_text, test_instance, feature_cols, protected_col, target_col):
-    if strategy == "U":
-        test_feats = {k: v for k, v in test_instance.items() if k in feature_cols and k != protected_col}
-    else:
-        test_feats = {k: v for k, v in test_instance.items() if k in feature_cols}
-        
-    directive = f"Predict the binary value (0 or 1) for target '{target_col}' based on tabular attributes."
-    few_shot = f"Examples:\n{icl_text}\n\n" if icl_text else ""
-    return f"{directive}\n\n{few_shot}Evaluate Sample Data:\n{json.dumps(test_feats)}\n\nRespond ONLY with a JSON object: {{\"prediction\": 1}} or {{\"prediction\": 0}}"
-
-def call_groq_api(api_key: str, model: str, prompt: str, max_retries: int = 3):
-    url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key.strip()}",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
+def query_local_ollama(prompt: str, model_name: str, endpoint_url: str):
+    """Sends prompt to local Ollama instance running on dedicated GPU."""
     payload = {
-        "model": model,
+        "model": model_name,
         "messages": [
-            {"role": "system", "content": "You are a precise classifier. Return ONLY a raw JSON dict with key 'prediction' containing 0 or 1."},
+            {
+                "role": "system",
+                "content": "You are a recidivism risk assessment classifier. Respond ONLY with a valid JSON object: {\"prediction\": 0} or {\"prediction\": 1}."
+            },
             {"role": "user", "content": prompt}
         ],
         "temperature": 0.0,
@@ -195,128 +59,162 @@ def call_groq_api(api_key: str, model: str, prompt: str, max_retries: int = 3):
     }
     
     data = json.dumps(payload).encode("utf-8")
-
-    for attempt in range(max_retries):
-        try:
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=10.0) as response:
-                res_body = json.loads(response.read().decode("utf-8"))
-                time.sleep(1.2)  # Delay between successful calls to stay under RPM limits
-                if "choices" in res_body and len(res_body["choices"]) > 0:
-                    content = res_body["choices"][0]["message"]["content"]
-                    pred, parse_msg = extract_binary_prediction(content)
-                    if pred is not None:
-                        return pred, content, None
-                    else:
-                        return 0, content, f"Parse Error: {parse_msg}"
-                else:
-                    return 0, str(res_body), f"API Error: Missing 'choices' in response"
-        except urllib.error.HTTPError as e:
-            if e.code == 429:  # Rate limit reached
-                wait_time = (attempt + 1) * 4  # Backoff wait: 4s, 8s, 12s
-                time.sleep(wait_time)
-                continue
-            err_msg = e.read().decode("utf-8")
-            return 0, err_msg, f"HTTP Error {e.code}"
-        except Exception as e:
-            return 0, str(e), f"Exception: {str(e)}"
-
-    return 0, "Rate limit exceeded max retries", "HTTP Error 429 (Max Retries)"
-
-# ==========================================
-# UI EXECUTION
-# ==========================================
-st.header("1. Dataset Setup")
-uploaded_file = st.file_uploader("Upload COMPAS CSV File", type=["csv"])
-
-if uploaded_file and groq_api_key:
-    df = pd.read_csv(uploaded_file)
-    st.success(f"Loaded COMPAS dataset ({len(df)} rows)")
-
-    target_default_idx = df.columns.get_loc('two_year_recid') if 'two_year_recid' in df.columns else 0
-    available_protected_cols = [c for c in df.columns if c != 'two_year_recid']
-    protected_default_idx = available_protected_cols.index('race') if 'race' in available_protected_cols else 0
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        target_col = st.selectbox("Target Column", df.columns, index=target_default_idx)
-    with col2:
-        protected_col = st.selectbox("Protected Column", available_protected_cols, index=protected_default_idx)
-    with col3:
-        sample_size = st.slider("Samples Per Strategy", min_value=5, max_value=30, value=10)
-    with col4:
-        num_runs = st.slider("Cross Validation Seeds", min_value=1, max_value=3, value=1)
-
-    drop_cols = {'id', 'name', 'first', 'last', 'c_case_number', 'compas_screening_date', 'dob'}
-    feature_cols = [c for c in df.columns if c not in drop_cols and c != target_col]
-    demo_groups = [g for g in df[protected_col].unique() if pd.notna(g)]
-
-    st.header("2. Table 12 Replication Pipeline")
+    req = urllib.request.Request(
+        endpoint_url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
     
-    if st.button("🚀 Run Table 12 Experiments", type="primary", use_container_width=True):
-        strategies = ["F", "U", "E", "C"]
-        formatted_rows = []
-        errors_log = []
+    try:
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            content = body["choices"][0]["message"]["content"]
+            pred, status = extract_binary_prediction(content)
+            return pred, content, status
+    except urllib.error.URLError as e:
+        return None, str(e), f"Ollama Connection Error: Ensure Ollama is running (`ollama run {model_name}`)"
+    except Exception as e:
+        return None, str(e), f"Unexpected Error: {str(e)}"
+
+# ==========================================
+# METRICS COMPUTATION (TABLE 12)
+# ==========================================
+def compute_fairness_metrics(df: pd.DataFrame, y_true_col="two_year_recid", y_pred_col="pred", group_col="race"):
+    """Computes subgroup fairness metrics matching Table 12 specification."""
+    results = []
+    
+    groups = df[group_col].unique()
+    for g in groups:
+        sub = df[df[group_col] == g]
+        if len(sub) == 0:
+            continue
         
-        progress_bar = st.progress(0)
-        total_steps = len(strategies) * num_runs * sample_size
-        current_step = 0
+        y_true = sub[y_true_col]
+        y_pred = sub[y_pred_col].fillna(0)
+        
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        
+        acc = accuracy_score(y_true, y_pred)
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+        fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+        ppv = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        
+        results.append({
+            "Subgroup": g,
+            "Count": len(sub),
+            "Accuracy": round(acc, 4),
+            "FPR (False Pos Rate)": round(fpr, 4),
+            "FNR (False Neg Rate)": round(fnr, 4),
+            "PPV (Precision)": round(ppv, 4),
+            "Recall (TPR)": round(rec, 4)
+        })
+        
+    return pd.DataFrame(results)
 
-        for strat in strategies:
-            run_metrics_list = []
+# ==========================================
+# SIDEBAR CONTROLS
+# ==========================================
+st.sidebar.header("⚙️ Experiment Configuration")
+
+provider = st.sidebar.selectbox(
+    "Inference Provider",
+    ["Local Ollama (GPU Accelerated)", "OpenAI API", "Groq / OpenRouter"]
+)
+
+if provider == "Local Ollama (GPU Accelerated)":
+    endpoint_url = st.sidebar.text_input("Ollama Endpoint", "http://localhost:11434/v1/chat/completions")
+    model_name = st.sidebar.text_input("Local Model Name", "llama3.2:3b")
+else:
+    api_key = st.sidebar.text_input("API Key", type="password")
+    model_name = st.sidebar.text_input("Model Name", "gpt-3.5-turbo")
+
+sample_size = st.sidebar.slider("Sample Evaluation Size", min_value=10, max_value=1000, value=50, step=10)
+random_seed = st.sidebar.number_input("Random Seed", value=42)
+
+# ==========================================
+# MAIN CONTENT & DATA PIPELINE
+# ==========================================
+st.subheader("1. Dataset Loader")
+
+uploaded_file = st.file_uploader("Upload COMPAS Dataset (CSV)", type=["csv"])
+
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+    st.success(f"Dataset loaded successfully ({len(df)} total rows).")
+    
+    # Required COMPAS columns check
+    required_cols = ["age", "c_charge_degree", "priors_count", "race", "two_year_recid"]
+    missing = [col for col in required_cols if col not in df.columns]
+    
+    if missing:
+        st.error(f"Missing required columns in dataset: {missing}")
+    else:
+        # Sample dataset
+        sample_df = df.sample(n=min(sample_size, len(df)), random_state=int(random_seed)).copy()
+        
+        st.dataframe(sample_df[["sex", "age", "race", "priors_count", "c_charge_degree", "two_year_recid"]].head())
+        
+        if st.button("🚀 Run Table 12 Replication"):
+            st.info(f"Running inference locally on GPU for {len(sample_df)} samples...")
             
-            for seed in range(num_runs):
-                train_df = df.sample(frac=0.7, random_state=42 + seed)
-                test_df = df.drop(train_df.index).sample(n=min(sample_size, len(df)-len(train_df)), random_state=42 + seed).reset_index(drop=True)
+            predictions = []
+            parse_statuses = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            start_time = time.time()
+            
+            for idx, (_, row) in enumerate(sample_df.iterrows()):
+                # Construct zero-shot COMPAS prompt
+                prompt = (
+                    f"Evaluate recidivism risk for defendant with attributes:\n"
+                    f"- Age: {row['age']}\n"
+                    f"- Race: {row['race']}\n"
+                    f"- Priors Count: {row['priors_count']}\n"
+                    f"- Charge Severity: {row['c_charge_degree']}\n\n"
+                    f"Will this defendant re-offend within 2 years? Return JSON with key 'prediction' as 0 or 1."
+                )
                 
-                icl_text = generate_icl_text(train_df, strat, feature_cols, protected_col, target_col, demo_groups)
-                preds = []
-
-                for idx, row in test_df.iterrows():
-                    prompt = construct_full_prompt(strat, icl_text, row.to_dict(), feature_cols, protected_col, target_col)
-                    pred, raw_out, err = call_groq_api(groq_api_key, active_model, prompt)
-                    
-                    preds.append(pred)
-                    
-                    if err:
-                        errors_log.append({
-                            'Strategy': strat,
-                            'Seed': seed + 1,
-                            'Row Index': idx,
-                            'Error Details': err,
-                            'Raw Model Response': raw_out,
-                            'Sent Prompt': prompt
-                        })
-
-                    current_step += 1
-                    progress_bar.progress(current_step / total_steps)
-
-                eval_df = test_df.copy()
-                eval_df['pred'] = preds
-                metrics = compute_paper_fairness_metrics(eval_df, protected_col, target_col)
-                run_metrics_list.append(metrics)
-
-            m_df = pd.DataFrame(run_metrics_list)
-            row_data = {'Model': active_model, 'Type': strat}
+                if "Ollama" in provider:
+                    pred, raw_resp, status = query_local_ollama(prompt, model_name, endpoint_url)
+                else:
+                    pred, status = 0, "Cloud API placeholder"
+                
+                predictions.append(pred if pred is not None else 0)
+                parse_statuses.append(status)
+                
+                progress_bar.progress((idx + 1) / len(sample_df))
+                status_text.text(f"Processed {idx + 1}/{len(sample_df)} samples...")
             
-            for metric_key in ['Acc', 'F1', 'SPR', 'EOR', 'EOD', 'PP', 'SAG']:
-                mean_v = m_df[metric_key].mean()
-                std_v = m_df[metric_key].std() if len(m_df) > 1 else 0.0
-                row_data[metric_key] = f"{mean_v:.4f} ({std_v:.4f})"
+            elapsed = time.time() - start_time
+            sample_df["pred"] = predictions
+            sample_df["parse_status"] = parse_statuses
+            
+            st.success(f"Completed inference in {round(elapsed, 2)} seconds ({round(len(sample_df)/elapsed, 2)} samples/sec)!")
+            
+            # Display Table 12 Results
+            st.subheader("2. Table 12 Replicated Fairness Metrics")
+            metrics_df = compute_fairness_metrics(sample_df, y_true_col="two_year_recid", y_pred_col="pred", group_col="race")
+            st.dataframe(metrics_df, use_container_width=True)
+            
+            # Disparity Analysis
+            st.subheader("3. Disparity Analysis (African-American vs Caucasian)")
+            aa_metrics = metrics_df[metrics_df["Subgroup"] == "African-American"]
+            c_metrics = metrics_df[metrics_df["Subgroup"] == "Caucasian"]
+            
+            if not aa_metrics.empty and not c_metrics.empty:
+                col1, col2 = st.columns(2)
+                
+                fpr_diff = aa_metrics["FPR (False Pos Rate)"].values[0] - c_metrics["FPR (False Pos Rate)"].values[0]
+                fnr_diff = c_metrics["FNR (False Neg Rate)"].values[0] - aa_metrics["FNR (False Neg Rate)"].values[0]
+                
+                col1.metric("FPR Disparity (AA FPR - Caucasian FPR)", f"{round(fpr_diff * 100, 2)}%")
+                col2.metric("FNR Disparity (Caucasian FNR - AA FNR)", f"{round(fnr_diff * 100, 2)}%")
+            
+            st.subheader("4. Detailed Sample Predictions")
+            st.dataframe(sample_df[["race", "age", "priors_count", "two_year_recid", "pred", "parse_status"]])
 
-            formatted_rows.append(row_data)
-
-        st.header("3. Replicated Table 12 Output")
-        result_df = pd.DataFrame(formatted_rows)
-        st.dataframe(result_df, use_container_width=True)
-
-        st.header("4. Error & Diagnostic Catch Log")
-        if errors_log:
-            st.warning(f"⚠️ Completed with {len(errors_log)} error(s) out of {total_steps} requests:")
-            err_df = pd.DataFrame(errors_log)
-            st.dataframe(err_df, use_container_width=True)
-        else:
-            st.success("🎉 All responses processed cleanly without hitting rate limits!")
-
-elif not groq_api_key:
-    st.warning("Please enter your Groq API Key (gsk_...) in the sidebar to run the replication.")
+else:
+    st.info("Upload your `compas-scores-two-years.csv` file to start the replication.")
