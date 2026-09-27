@@ -23,9 +23,8 @@ st.caption("Local GPU Execution via Ollama (Zero API Costs / No Rate Limits)")
 # INFERENCE ROUTERS
 # ==========================================
 def extract_binary_prediction(response_text: str):
-    """Parses JSON or raw text response to extra 0 or 1 binary prediction."""
+    """Parses JSON or raw text response to extract a 0 or 1 binary prediction."""
     try:
-        # Try direct JSON load
         data = json.loads(response_text)
         if isinstance(data, dict):
             val = data.get("prediction", data.get("recidivism", None))
@@ -34,33 +33,40 @@ def extract_binary_prediction(response_text: str):
     except Exception:
         pass
     
-    # Fallback substring extraction
     text_lower = response_text.lower()
     if "prediction: 1" in text_lower or "'prediction': 1" in text_lower or '"prediction": 1' in text_lower:
         return 1, "Fallback (Parsed 1)"
     if "prediction: 0" in text_lower or "'prediction': 0" in text_lower or '"prediction": 0' in text_lower:
         return 0, "Fallback (Parsed 0)"
     
-    return None, f"Parsing Error: Could not parse 0/1 from '{response_text[:50]}...'"
+    return 0, f"Parsing Fallback: Defaulted to 0"
 
-def query_local_ollama(prompt: str, model_name: str, endpoint_url: str):
-    """Sends prompt to local Ollama instance running on dedicated GPU."""
+def query_local_ollama(prompt: str, model_name: str, base_url: str):
+    """Sends prompt to local Ollama instance using native /api/chat endpoint."""
+    # Ensure URL points to native Ollama API
+    clean_url = base_url.strip().rstrip("/")
+    if not clean_url.endswith("/api/chat"):
+        clean_url = "http://localhost:11434/api/chat"
+        
     payload = {
         "model": model_name,
         "messages": [
             {
                 "role": "system",
-                "content": "You are a recidivism risk assessment classifier. Respond ONLY with a valid JSON object: {\"prediction\": 0} or {\"prediction\": 1}."
+                "content": "You are a recidivism risk assessment classifier. Return ONLY a valid JSON object: {\"prediction\": 0} or {\"prediction\": 1}."
             },
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"}
+        "stream": False,
+        "format": "json",
+        "options": {
+            "temperature": 0.0
+        }
     }
     
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        endpoint_url,
+        clean_url,
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST"
@@ -69,11 +75,11 @@ def query_local_ollama(prompt: str, model_name: str, endpoint_url: str):
     try:
         with urllib.request.urlopen(req, timeout=30.0) as resp:
             body = json.loads(resp.read().decode("utf-8"))
-            content = body["choices"][0]["message"]["content"]
+            content = body["message"]["content"]
             pred, status = extract_binary_prediction(content)
             return pred, content, status
     except urllib.error.URLError as e:
-        return None, str(e), f"Ollama Connection Error: Ensure Ollama is running (`ollama run {model_name}`)"
+        return None, str(e), f"Ollama Connection Error: Ensure Ollama is running in background"
     except Exception as e:
         return None, str(e), f"Unexpected Error: {str(e)}"
 
@@ -120,11 +126,11 @@ st.sidebar.header("⚙️ Experiment Configuration")
 
 provider = st.sidebar.selectbox(
     "Inference Provider",
-    ["Local Ollama (GPU Accelerated)", "OpenAI API", "Groq / OpenRouter"]
+    ["Local Ollama (GPU Accelerated)", "OpenAI API"]
 )
 
 if provider == "Local Ollama (GPU Accelerated)":
-    endpoint_url = st.sidebar.text_input("Ollama Endpoint", "http://localhost:11434/v1/chat/completions")
+    endpoint_url = st.sidebar.text_input("Ollama Endpoint", "http://localhost:11434/api/chat")
     model_name = st.sidebar.text_input("Local Model Name", "llama3.2:3b")
 else:
     api_key = st.sidebar.text_input("API Key", type="password")
@@ -144,20 +150,18 @@ if uploaded_file is not None:
     df = pd.read_csv(uploaded_file)
     st.success(f"Dataset loaded successfully ({len(df)} total rows).")
     
-    # Required COMPAS columns check
     required_cols = ["age", "c_charge_degree", "priors_count", "race", "two_year_recid"]
     missing = [col for col in required_cols if col not in df.columns]
     
     if missing:
         st.error(f"Missing required columns in dataset: {missing}")
     else:
-        # Sample dataset
         sample_df = df.sample(n=min(sample_size, len(df)), random_state=int(random_seed)).copy()
         
         st.dataframe(sample_df[["sex", "age", "race", "priors_count", "c_charge_degree", "two_year_recid"]].head())
         
         if st.button("🚀 Run Table 12 Replication"):
-            st.info(f"Running inference locally on GPU for {len(sample_df)} samples...")
+            st.info(f"Running GPU-accelerated local inference for {len(sample_df)} samples...")
             
             predictions = []
             parse_statuses = []
@@ -167,7 +171,6 @@ if uploaded_file is not None:
             start_time = time.time()
             
             for idx, (_, row) in enumerate(sample_df.iterrows()):
-                # Construct zero-shot COMPAS prompt
                 prompt = (
                     f"Evaluate recidivism risk for defendant with attributes:\n"
                     f"- Age: {row['age']}\n"
@@ -194,12 +197,10 @@ if uploaded_file is not None:
             
             st.success(f"Completed inference in {round(elapsed, 2)} seconds ({round(len(sample_df)/elapsed, 2)} samples/sec)!")
             
-            # Display Table 12 Results
             st.subheader("2. Table 12 Replicated Fairness Metrics")
             metrics_df = compute_fairness_metrics(sample_df, y_true_col="two_year_recid", y_pred_col="pred", group_col="race")
             st.dataframe(metrics_df, use_container_width=True)
             
-            # Disparity Analysis
             st.subheader("3. Disparity Analysis (African-American vs Caucasian)")
             aa_metrics = metrics_df[metrics_df["Subgroup"] == "African-American"]
             c_metrics = metrics_df[metrics_df["Subgroup"] == "Caucasian"]
